@@ -11271,6 +11271,102 @@ fn test_arbitration_cases_indexed_by_student() {
     );
 }
 
+/// INV07 — resolve_arbitration() must conserve the arbitration pool across
+/// both outcomes: the pool balance returns to zero and the recipient's token
+/// balance increases by exactly the amount recorded in the pool at escalation.
+#[test]
+fn test_invariant_inv07_arbitration_fee_custody_is_conserved() {
+    let (env, contract_id, token_id, admin, sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+    let token_client = token::Client::new(&env, &token_id);
+
+    let fee_per_case = 5_000_000i128;
+
+    // --- Outcome 1: resolved for the student ---
+    let student = setup_arbitration(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-INV07-STUDENT",
+        fee_per_case,
+    );
+    let course_id = String::from_str(&env, "COURSE-INV07-STUDENT");
+
+    client.escalate_to_arbitration(&student, &course_id);
+    let pool_at_escalation = client.get_arbitration_pool_balance(&token_id);
+    assert_eq!(
+        pool_at_escalation, fee_per_case,
+        "escalation must move exactly the fee into the arbitration pool"
+    );
+
+    let student_before = token_client.balance(&student);
+    env.mock_all_auths_allowing_non_root_auth();
+    client.resolve_arbitration(
+        &admin,
+        &sec_admin,
+        &student,
+        &course_id,
+        &true,
+        &String::from_str(&env, "STUDENT_WON"),
+    );
+    let student_after = token_client.balance(&student);
+
+    assert_eq!(
+        client.get_arbitration_pool_balance(&token_id),
+        0,
+        "arbitration pool must be empty after a student-win resolution"
+    );
+    assert_eq!(
+        student_after - student_before,
+        pool_at_escalation,
+        "student payout must equal the pool balance recorded at escalation"
+    );
+
+    // --- Outcome 2: resolved for the instructor ---
+    let student2 = setup_arbitration(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-INV07-INSTRUCTOR",
+        fee_per_case,
+    );
+    let course_id2 = String::from_str(&env, "COURSE-INV07-INSTRUCTOR");
+
+    client.escalate_to_arbitration(&student2, &course_id2);
+    let pool_at_escalation2 = client.get_arbitration_pool_balance(&token_id);
+    assert_eq!(
+        pool_at_escalation2, fee_per_case,
+        "escalation must move exactly the fee into the arbitration pool"
+    );
+
+    let instructor_before = token_client.balance(&instructor);
+    env.mock_all_auths_allowing_non_root_auth();
+    client.resolve_arbitration(
+        &admin,
+        &sec_admin,
+        &student2,
+        &course_id2,
+        &false,
+        &String::from_str(&env, "INSTRUCTOR_WON"),
+    );
+    let instructor_after = token_client.balance(&instructor);
+
+    assert_eq!(
+        client.get_arbitration_pool_balance(&token_id),
+        0,
+        "arbitration pool must be empty after an instructor-win resolution"
+    );
+    assert_eq!(
+        instructor_after - instructor_before,
+        pool_at_escalation2,
+        "instructor payout must equal the pool balance recorded at escalation"
+    );
+}
+
 /// #256 — resolve_arbitration() with for_student=true must refund the fee to the caller.
 #[test]
 fn test_resolve_arbitration_refund_to_student() {
@@ -11317,6 +11413,60 @@ fn test_resolve_arbitration_refund_to_student() {
         case.resolution_reason,
         Some(String::from_str(&env, "STUDENT_WON"))
     );
+}
+
+/// `waitlist_leave` by a student who never joined must be rejected and must
+/// leave the queue contents and FIFO order untouched.
+#[test]
+fn test_waitlist_leave_non_member_rejected_preserves_queue() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let course_id_str = "COURSE-WAITLIST-NONMEMBER";
+    let course_id = String::from_str(&env, course_id_str);
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        course_id_str,
+        1_000_000_000,
+    );
+
+    // Fill the course to capacity so further students must join the waitlist.
+    let course = client.get_course(&course_id).unwrap();
+    let capacity = course.max_capacity;
+    for _ in 0..capacity {
+        mint_and_enroll_student(&env, &client, &token_id, course_id_str);
+    }
+
+    let first = Address::generate(&env);
+    let second = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&first, &100_000_000_000);
+    token::StellarAssetClient::new(&env, &token_id).mint(&second, &100_000_000_000);
+    client.join_waitlist(&first, &course_id);
+    client.join_waitlist(&second, &course_id);
+
+    let queue_before = client.get_waitlist(&course_id);
+    assert_eq!(queue_before.len(), 2);
+
+    // A third student who never joined must not be able to leave the queue.
+    let third = Address::generate(&env);
+    let result = client.try_waitlist_leave(&third, &course_id);
+    assert!(
+        result.is_err(),
+        "waitlist_leave must reject a student who never joined the waitlist"
+    );
+
+    let queue_after = client.get_waitlist(&course_id);
+    assert_eq!(
+        queue_after.len(),
+        2,
+        "a rejected leave must not mutate the queue"
+    );
+    assert_eq!(queue_after.get(0).unwrap(), first);
+    assert_eq!(queue_after.get(1).unwrap(), second);
 }
 
 /// #256 — resolve_arbitration() with for_student=false must pay the fee to the instructor.
@@ -13751,6 +13901,36 @@ fn test_withdraw_tokens_rejects_contract_as_destination() {
 // ============================================================
 // ISSUE #141 — cancel_upgrade signature requirement
 // ============================================================
+
+// ============================================================
+// PER-TOKEN FEE CONFIG BOUNDARY TESTS
+// ============================================================
+
+#[test]
+fn test_set_fee_config_accepts_max_bps() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, _instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    client.set_fee_config(&admin, &token_id, &10_000u32);
+
+    assert_eq!(
+        client.get_fee_config(&token_id),
+        10_000u32,
+        "set_fee_config must accept exactly 10_000 bps and store it"
+    );
+}
+
+#[test]
+fn test_set_fee_config_rejects_above_max_bps() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, _instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let result = client.try_set_fee_config(&admin, &token_id, &10_001u32);
+    assert!(
+        result.is_err(),
+        "set_fee_config must reject a per-token fee above 10_000 bps"
+    );
+}
 
 #[test]
 fn test_cancel_upgrade_accepts_admins_in_either_order() {

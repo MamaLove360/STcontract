@@ -60,7 +60,7 @@ def split_top_level(text):
         if char in "<([":
             depth += 1
         elif char in ">)]":
-            depth -= 1
+            depth = max(0, depth - 1)
         if char == "," and depth == 0:
             parts.append(current)
             current = ""
